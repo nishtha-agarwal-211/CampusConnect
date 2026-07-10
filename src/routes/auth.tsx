@@ -202,9 +202,7 @@ function Field({
           className="w-full bg-transparent px-1 py-2 font-mono text-sm outline-none"
         />
         {rightElement && (
-          <div className="absolute right-2 flex items-center justify-center">
-            {rightElement}
-          </div>
+          <div className="absolute right-2 flex items-center justify-center">{rightElement}</div>
         )}
       </div>
     </label>
