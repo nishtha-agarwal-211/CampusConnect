@@ -44,31 +44,43 @@ jobs:
             if (context.eventName === 'pull_request_target') {
               // Triggered by a PR event — process that single PR
               const pr = context.payload.pull_request;
-              prsToProcess = [{ number: pr.number, headSha: pr.head.sha, assignees: pr.assignees, author: pr.user.login }];
+              // Re-fetch to get the mergeable field (payload may not have it)
+              const { data: fullPr } = await github.rest.pulls.get({ owner, repo, pull_number: pr.number });
+              prsToProcess = [{ number: fullPr.number, headSha: fullPr.head.sha, assignees: fullPr.assignees, author: fullPr.user.login, mergeable: fullPr.mergeable }];
             } else {
               // Triggered manually via workflow_dispatch
               const inputPrNumber = context.payload.inputs?.pr_number;
               if (inputPrNumber && inputPrNumber.trim() !== '') {
                 // Specific PR number was provided
                 const { data: prData } = await github.rest.pulls.get({ owner, repo, pull_number: parseInt(inputPrNumber) });
-                prsToProcess = [{ number: prData.number, headSha: prData.head.sha, assignees: prData.assignees, author: prData.user.login }];
+                prsToProcess = [{ number: prData.number, headSha: prData.head.sha, assignees: prData.assignees, author: prData.user.login, mergeable: prData.mergeable }];
               } else {
                 // No PR number provided — fetch ALL open PRs
+                // Must use pulls.get() per PR to get the mergeable field
                 let page = 1;
+                let listedPRs = [];
                 while (true) {
                   const { data: openPRs } = await github.rest.pulls.list({ owner, repo, state: 'open', per_page: 100, page });
-                  for (const p of openPRs) {
-                    prsToProcess.push({ number: p.number, headSha: p.head.sha, assignees: p.assignees, author: p.user.login });
-                  }
+                  listedPRs = listedPRs.concat(openPRs);
                   if (openPRs.length < 100) break;
                   page++;
                 }
-                console.log(`Found ${prsToProcess.length} open PRs to evaluate.`);
+                console.log(`Found ${listedPRs.length} open PRs. Fetching full details for mergeable status...`);
+                for (const p of listedPRs) {
+                  try {
+                    const { data: fullPr } = await github.rest.pulls.get({ owner, repo, pull_number: p.number });
+                    prsToProcess.push({ number: fullPr.number, headSha: fullPr.head.sha, assignees: fullPr.assignees, author: fullPr.user.login, mergeable: fullPr.mergeable });
+                  } catch(e) {
+                    console.error(`Could not fetch full data for PR #${p.number}: ${e.message}`);
+                    prsToProcess.push({ number: p.number, headSha: p.head.sha, assignees: p.assignees, author: p.user.login, mergeable: null });
+                  }
+                }
+                console.log(`Loaded full details for ${prsToProcess.length} PRs.`);
               }
             }
 
             // ─── Helper function: evaluate + label a single PR ──────────────────
-            async function evaluatePR({ number: prNumber, headSha, assignees, author }) {
+            async function evaluatePR({ number: prNumber, headSha, assignees, author, mergeable }) {
               console.log(`\n🔍 Evaluating PR #${prNumber} (SHA: ${headSha})...`);
 
               // ─── 1. Fetch ALL check runs for this commit ──────────────────────
@@ -141,7 +153,41 @@ jobs:
                 }
               };
 
-              // ─── 6. Still pending? Log and skip ───────────────────────────────
+              // ─── 6a. MERGE CONFLICT CHECK (highest priority) ──────────────────
+              // mergeable: true = clean, false = has conflicts, null = still computing
+              if (mergeable === false) {
+                await removeLabel("Blue");
+                await addLabel("Red");
+
+                const conflictBody =
+                  `## ⚠️ Merge Conflicts Detected!\n\n` +
+                  `Hey @${targetUser}, this PR has **merge conflicts** with the base branch and cannot be merged until they are resolved. 🙏\n\n` +
+                  `### 🛠️ How to Resolve\n\n` +
+                  `You can resolve conflicts directly in the browser by clicking the **\"Resolve conflicts\"** button on the PR page, or locally via the command line:\n\n` +
+                  `\`\`\`bash\n` +
+                  `# Sync your branch with the latest main\n` +
+                  `git checkout main\n` +
+                  `git pull origin main\n` +
+                  `git checkout your-branch-name\n` +
+                  `git merge main\n` +
+                  `# Resolve the conflicts in your editor, then:\n` +
+                  `git add .\n` +
+                  `git commit -m "fix: resolve merge conflicts"\n` +
+                  `git push\n` +
+                  `\`\`\`\n\n` +
+                  `---\n` +
+                  `_Once conflicts are resolved and all CI checks pass, the **Red** label will automatically be replaced with **Blue**! 💙_`;
+
+                await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body: conflictBody });
+                console.log(`⚠️ PR #${prNumber} labeled "Red" — merge conflicts detected.`);
+                return;
+              }
+
+              if (mergeable === null) {
+                console.log(`PR #${prNumber}: GitHub is still computing mergeability. Skipping conflict check for now.`);
+              }
+
+              // ─── 6b. Still pending CI? Log and skip ───────────────────────────
               if (pendingChecks.length > 0 && failedChecks.length === 0) {
                 const names = pendingChecks.map((c) => `\`${c.name}\``).join(", ");
                 console.log(`PR #${prNumber}: Checks still pending: ${names}. Skipping.`);
