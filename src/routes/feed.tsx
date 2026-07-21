@@ -628,6 +628,7 @@ export default function Feed() {
                   const postComments: Comment[] = Array.isArray(post.comments)
                     ? post.comments.filter((c) => !c.deleted_at)
                     : [];
+
                   const shareUrl = `${window.location.origin}/feed?postId=${post.id}`;
                   return (
                     <article
